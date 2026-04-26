@@ -155,6 +155,10 @@ You haven't replaced the placeholder token in `trim_ical.php`. That's intentiona
 
 PRs welcome.
 
+## Credits
+
+The original `trim_ical.php` was posted by [@permissionBRICK](https://github.com/permissionBRICK) in [home-assistant/core#148315](https://github.com/home-assistant/core/issues/148315#issuecomment-3813796993). This repo extends that work with security hardening, configuration knobs, and documentation.
+
 ## License
 
 [MIT](LICENSE)
