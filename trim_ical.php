@@ -5,17 +5,33 @@
 
 declare(strict_types=1);
 
-$url = $_GET['url'] ?? '';
+const ICAL_MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024; // 20 MB cap on remote .ics download
+const ICAL_MAX_REDIRECTS = 5;
 
-$token = $_GET['token'] ?? '';
-// TODO: ADD A RANDOM TOKEN HERE
-if($token != "YOUR-RANDOM-TOKEN") {
+// Trim window relative to "now" (UTC). Output keeps events that overlap [now - PAST, now + FUTURE).
+// Values are ISO-8601 durations accepted by DateInterval (e.g. 'P7D', 'P2W', 'P1M', 'P1Y').
+const ICAL_WINDOW_PAST   = 'P7D';
+const ICAL_WINDOW_FUTURE = 'P30D';
+
+// TODO: replace this placeholder with a long random token before deploying.
+$expectedToken = 'YOUR-RANDOM-TOKEN';
+if ($expectedToken === 'YOUR-RANDOM-TOKEN' || $expectedToken === '') {
+    http_response_code(500);
+    header('Content-Type: text/plain; charset=utf-8');
+    echo "Server misconfigured: set a real token in trim_ical.php\n";
+    exit;
+}
+
+$token = (string)($_GET['token'] ?? '');
+if (!hash_equals($expectedToken, $token)) {
     http_response_code(401);
     header('Content-Type: text/plain; charset=utf-8');
     echo "Invalid token!\n";
     exit;
 }
-if (!$url) {
+
+$url = (string)($_GET['url'] ?? '');
+if ($url === '') {
     http_response_code(400);
     header('Content-Type: text/plain; charset=utf-8');
     echo "Missing required parameter: url\n";
@@ -48,10 +64,10 @@ if ($ical === null) {
 $ical = normalize_newlines($ical);
 $lines = unfold_ical_lines(explode("\n", $ical));
 
-// Window: [now-7d, now+30d)
+// Window: [now - ICAL_WINDOW_PAST, now + ICAL_WINDOW_FUTURE)
 $now = new DateTimeImmutable('now', new DateTimeZone('UTC'));
-$windowStart = $now->sub(new DateInterval('P7D'));
-$windowEnd   = $now->add(new DateInterval('P30D'));
+$windowStart = $now->sub(new DateInterval(ICAL_WINDOW_PAST));
+$windowEnd   = $now->add(new DateInterval(ICAL_WINDOW_FUTURE));
 
 // Parse VCALENDAR into components (keep VTIMEZONE blocks so TZID/DST can be preserved)
 $calendar = parse_vcalendar_components($lines);
@@ -164,30 +180,159 @@ echo $outText;
 /* ============================ helpers ============================ */
 
 function download_url(string $url): ?string {
-    if (function_exists('curl_init')) {
-        $ch = curl_init($url);
-        curl_setopt_array($ch, [
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_FOLLOWLOCATION => true,
-            CURLOPT_MAXREDIRS => 5,
+    if (!function_exists('curl_init')) {
+        // We require cURL so we can pin DNS and enforce per-redirect SSRF checks.
+        return null;
+    }
+
+    $current = $url;
+    for ($i = 0; $i <= ICAL_MAX_REDIRECTS; $i++) {
+        $resolved = resolve_and_validate_url($current);
+        if ($resolved === null) return null;
+
+        $body = '';
+        $location = null;
+
+        $ch = curl_init();
+        $opts = [
+            CURLOPT_URL => $current,
+            CURLOPT_FOLLOWLOCATION => false, // we follow redirects manually so we can re-validate each hop
             CURLOPT_CONNECTTIMEOUT => 10,
-            CURLOPT_TIMEOUT => 20,
+            CURLOPT_TIMEOUT => 30,
             CURLOPT_USERAGENT => 'ical-trimmer/2.0',
-        ]);
-        $data = curl_exec($ch);
+            CURLOPT_PROTOCOLS => CURLPROTO_HTTP | CURLPROTO_HTTPS,
+            CURLOPT_REDIR_PROTOCOLS => CURLPROTO_HTTP | CURLPROTO_HTTPS,
+            CURLOPT_SSL_VERIFYPEER => true,
+            CURLOPT_SSL_VERIFYHOST => 2,
+            CURLOPT_WRITEFUNCTION => function ($ch, string $chunk) use (&$body) {
+                $body .= $chunk;
+                if (strlen($body) > ICAL_MAX_DOWNLOAD_BYTES) {
+                    return 0; // returning < strlen($chunk) aborts the transfer
+                }
+                return strlen($chunk);
+            },
+            CURLOPT_HEADERFUNCTION => function ($ch, string $header) use (&$location) {
+                if (stripos($header, 'location:') === 0) {
+                    $location = trim(substr($header, 9));
+                }
+                return strlen($header);
+            },
+        ];
+
+        // Pin DNS for hostnames so the IP we just validated is the one cURL connects to.
+        if (!filter_var($resolved['host'], FILTER_VALIDATE_IP)) {
+            $opts[CURLOPT_RESOLVE] = [
+                $resolved['host'] . ':' . $resolved['port'] . ':' . implode(',', $resolved['ips']),
+            ];
+        }
+
+        curl_setopt_array($ch, $opts);
+        $ok = curl_exec($ch);
         $code = (int)curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
         curl_close($ch);
 
-        if ($data === false || $code < 200 || $code >= 300) return null;
-        return (string)$data;
+        if ($ok === false) return null;
+
+        if ($code >= 300 && $code < 400 && $location !== null) {
+            $next = resolve_redirect_url($current, $location);
+            if ($next === null) return null;
+            $current = $next;
+            continue;
+        }
+
+        if ($code < 200 || $code >= 300) return null;
+        return $body;
     }
-    $ctx = stream_context_create([
-        'http' => ['method' => 'GET', 'timeout' => 20, 'header' => "User-Agent: ical-trimmer/2.0\r\n"],
-        'ssl' => ['verify_peer' => true, 'verify_peer_name' => true],
-    ]);
-    $data = @file_get_contents($url, false, $ctx);
-    if ($data === false) return null;
-    return (string)$data;
+    return null;
+}
+
+function resolve_and_validate_url(string $url): ?array {
+    $parts = parse_url($url);
+    if (!$parts) return null;
+
+    $scheme = strtolower($parts['scheme'] ?? '');
+    if (!in_array($scheme, ['http', 'https'], true)) return null;
+
+    $host = $parts['host'] ?? '';
+    if ($host === '') return null;
+
+    $port = isset($parts['port']) ? (int)$parts['port'] : ($scheme === 'https' ? 443 : 80);
+    if ($port < 1 || $port > 65535) return null;
+
+    if (filter_var($host, FILTER_VALIDATE_IP)) {
+        $ips = [$host];
+    } else {
+        $ips = resolve_hostname_to_ips($host);
+        if (!$ips) return null;
+    }
+
+    // Reject if ANY resolved address is non-public — defends against split-horizon
+    // DNS and records that mix public/private IPs to confuse the validator.
+    foreach ($ips as $ip) {
+        if (!is_safe_public_ip($ip)) return null;
+    }
+
+    return ['host' => $host, 'port' => $port, 'ips' => $ips];
+}
+
+function resolve_hostname_to_ips(string $host): array {
+    $ips = [];
+    $a = @dns_get_record($host, DNS_A);
+    if (is_array($a)) {
+        foreach ($a as $r) {
+            if (!empty($r['ip'])) $ips[] = $r['ip'];
+        }
+    }
+    $aaaa = @dns_get_record($host, DNS_AAAA);
+    if (is_array($aaaa)) {
+        foreach ($aaaa as $r) {
+            if (!empty($r['ipv6'])) $ips[] = $r['ipv6'];
+        }
+    }
+    if (!$ips) {
+        $list = @gethostbynamel($host);
+        if (is_array($list)) $ips = $list;
+    }
+    return array_values(array_unique($ips));
+}
+
+function is_safe_public_ip(string $ip): bool {
+    // NO_PRIV_RANGE | NO_RES_RANGE blocks RFC1918, loopback, link-local
+    // (incl. 169.254.169.254 cloud metadata), IPv6 unique-local, ::1, etc.
+    if (!filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE)) {
+        return false;
+    }
+    // Also block CGNAT 100.64.0.0/10 (not covered by the filter flags).
+    if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+        $parts = explode('.', $ip);
+        if ((int)$parts[0] === 100 && (int)$parts[1] >= 64 && (int)$parts[1] <= 127) {
+            return false;
+        }
+    }
+    return true;
+}
+
+function resolve_redirect_url(string $base, string $location): ?string {
+    $location = trim($location);
+    if ($location === '') return null;
+
+    if (preg_match('#^[a-z][a-z0-9+.-]*://#i', $location)) {
+        return $location;
+    }
+
+    $parts = parse_url($base);
+    if (!$parts || empty($parts['scheme']) || empty($parts['host'])) return null;
+
+    $authority = $parts['scheme'] . '://' . $parts['host'];
+    if (!empty($parts['port'])) $authority .= ':' . $parts['port'];
+
+    if ($location[0] === '/') {
+        return $authority . $location;
+    }
+
+    $path = $parts['path'] ?? '/';
+    $baseDir = preg_replace('#/[^/]*$#', '/', $path);
+    return $authority . $baseDir . $location;
 }
 
 function normalize_newlines(string $s): string {
